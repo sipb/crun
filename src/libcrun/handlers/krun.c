@@ -605,6 +605,7 @@ libkrun_exec_ssh (void *cookie, libcrun_container_t *container,
                   runtime_spec_schema_config_schema_process *process)
 {
   struct krun_config *kconf = (struct krun_config *) cookie;
+  cleanup_free char *sock_path = NULL;
   cleanup_free char *sock_addr = NULL;
   size_t i, j;
   size_t n = process->args_len;
@@ -612,7 +613,26 @@ libkrun_exec_ssh (void *cookie, libcrun_container_t *container,
   char **argv = xmalloc0 ((6 + e + n) * sizeof (char *));
 
   // Access the Unix socket through ~/.local/share/containers/storage/overlay/SOME_HEX_STRING/merged.
-  xasprintf (&sock_addr, "unix%s" KRUN_SSH_SOCK_FILE, container->container_def->root->path);
+  xasprintf (&sock_path, "%s" KRUN_SSH_SOCK_FILE, container->container_def->root->path);
+
+  // This is an ugly hack, but we need to wait until the socket exists.
+  // Otherwise sometimes the Forgejo CI tries to exec before the SSH socket is ready.
+  if (access (sock_path, F_OK) != 0)
+    {
+      i = 0;
+      while (access (sock_path, F_OK) != 0)
+        {
+          if (i == 10)
+            error (EXIT_FAILURE, errno, "krun exec: ssh socket not found");
+          // Retry every second.
+          sleep (1);
+          i++;
+        }
+      // Additionally wait a bit longer so that the SSH server is fully up.
+      sleep (1);
+    }
+
+  xasprintf (&sock_addr, "unix%s", sock_path);
 
   i = 0;
   argv[i++] = "ssh";
