@@ -21,6 +21,7 @@
 #include "utils.h"
 #include "ring_buffer.h"
 #include <stdarg.h>
+#include <inttypes.h>
 #include <unistd.h>
 #include <string.h>
 #include <libgen.h>
@@ -50,6 +51,7 @@
 #  include <stdatomic.h>
 #else
 #  define atomic_long volatile long
+#  define atomic_int volatile int
 #endif
 #include "syscalls.h"
 
@@ -199,7 +201,7 @@ get_file_type (mode_t *mode, bool nofollow, const char *path)
 int
 create_file_if_missing_at (int dirfd, const char *file, mode_t mode, libcrun_error_t *err)
 {
-  cleanup_close int fd_write = openat (dirfd, file, O_CLOEXEC | O_CREAT | O_WRONLY, mode);
+  cleanup_close int fd_write = openat (dirfd, file, O_CLOEXEC | O_CREAT | O_WRONLY | O_NOFOLLOW, mode);
   if (fd_write < 0)
     {
       int saved_errno = errno;
@@ -207,7 +209,7 @@ create_file_if_missing_at (int dirfd, const char *file, mode_t mode, libcrun_err
       int ret;
 
       /* On errors, check if the file already exists.  */
-      ret = get_file_type_at (dirfd, &tmp_mode, false, file);
+      ret = get_file_type_at (dirfd, &tmp_mode, true, file);
       if (ret == 0 && S_ISREG (tmp_mode))
         return 0;
 
@@ -350,7 +352,7 @@ safe_openat_fallback (int dirfd, const char *rootfs, const char *path, int flags
   cleanup_close int fd = -1;
   char resolved[PATH_MAX];
   char buffer[PATH_MAX];
-  size_t rootfs_len = is_empty_string (rootfs) ? 0 : strlen (rootfs);
+  size_t rootfs_len = safe_strlen (rootfs);
   int ret;
 
   /* chroot_realpath resolves the last component as well, so when O_NOFOLLOW
@@ -743,10 +745,47 @@ crun_dir_p (const char *path, bool nofollow, libcrun_error_t *err)
   return crun_dir_p_at (AT_FDCWD, path, nofollow, err);
 }
 
+/* Detect the user namespace from the mapping in /proc/self/uid_map.  It cannot
+   tell apart the initial user namespace from a user namespace with a full
+   identity mapping, so it is used only as a fallback.  */
+static int
+check_running_in_user_namespace_uid_map (libcrun_error_t *err)
+{
+  cleanup_free char *buffer = NULL;
+  size_t len;
+  int ret;
+
+  ret = read_all_file ("/proc/self/uid_map", &buffer, &len, err);
+  if (UNLIKELY (ret < 0))
+    {
+      /* If the file does not exist, then the kernel does not support user namespaces and we for sure aren't in one.  */
+      if (crun_error_get_errno (err) == ENOENT)
+        {
+          crun_error_release (err);
+          return 0;
+        }
+      return ret;
+    }
+
+  return strstr (buffer, "4294967295") ? 0 : 1;
+}
+
+/* OpenVZ exposes /proc/vz both on the host and inside containers, while
+   /proc/bc is only exposed on the host.  This follows systemd's OpenVZ
+   detection.  */
+static bool
+running_in_openvz ()
+{
+  if (access ("/proc/vz", F_OK) < 0)
+    return false;
+
+  return access ("/proc/bc", F_OK) < 0 && errno == ENOENT;
+}
+
 int
 check_running_in_user_namespace (libcrun_error_t *err)
 {
-  static int run_in_userns = -1;
+  static atomic_int run_in_userns = -1;
   struct stat st;
   int ret;
 
@@ -755,18 +794,33 @@ check_running_in_user_namespace (libcrun_error_t *err)
     return ret;
 
   ret = stat ("/proc/self/ns/user", &st);
-  if (UNLIKELY (ret < 0))
+  if (ret == 0)
     {
-      /* If the file does not exist, then the kernel does not support user namespaces and we for sure aren't in one.  */
-      if (errno == ENOENT)
+      /* The inode is definitive when it matches.  OpenVZ virtualizes the
+         namespace inode numbers exposed through procfs, so a mismatch must fall
+         back to the uid_map detection there.  */
+      if (st.st_ino == PROC_USER_INIT_INO)
         {
           run_in_userns = 0;
           return run_in_userns;
         }
-      return crun_make_error (err, errno, "stat `/proc/self/ns/user`");
-    }
 
-  run_in_userns = st.st_ino == PROC_USER_INIT_INO ? 0 : 1;
+      if (! running_in_openvz ())
+        {
+          run_in_userns = 1;
+          return run_in_userns;
+        }
+    }
+  else if (UNLIKELY (errno != ENOENT))
+    return crun_make_error (err, errno, "stat `/proc/self/ns/user`");
+
+  /* Kernels older than 3.8 do not expose the user namespace here even though
+     they can still support user namespaces, so the uid_map is all we have.  */
+  ret = check_running_in_user_namespace_uid_map (err);
+  if (UNLIKELY (ret < 0))
+    return ret;
+
+  run_in_userns = ret;
   return run_in_userns;
 }
 
@@ -815,7 +869,7 @@ libcrun_initialize_apparmor (libcrun_error_t *err)
 {
   cleanup_close int fd = -1;
   int size;
-  char buf[2];
+  char buf[1];
 
   if (apparmor_enabled >= 0)
     return apparmor_enabled;
@@ -832,7 +886,7 @@ libcrun_initialize_apparmor (libcrun_error_t *err)
       return crun_make_error (err, errno, "open `/sys/module/apparmor/parameters/enabled`");
     }
 
-  size = TEMP_FAILURE_RETRY (read (fd, buf, 2));
+  size = TEMP_FAILURE_RETRY (read (fd, buf, sizeof (buf)));
 
   apparmor_enabled = size > 0 && buf[0] == 'Y' ? 1 : 0;
 
@@ -933,7 +987,17 @@ set_security_attr (libcrun_container_t *container, const char *lsm, const char *
   // Write out data
   ret = TEMP_FAILURE_RETRY (write (fd, data, strlen (data)));
   if (UNLIKELY (ret < 0))
-    return crun_make_error (err, errno, "write to file `%s`", attr_path);
+    {
+      /* ENOENT from the write is AppArmor telling the profile is unknown.
+         The data is "<op> <profile>".  */
+      if (errno == ENOENT && lsm != NULL && strcmp (lsm, "apparmor") == 0)
+        {
+          const char *profile = strchr (data, ' ');
+
+          return crun_make_error (err, 0, "apply apparmor profile `%s`: profile not loaded", profile ? profile + 1 : data);
+        }
+      return crun_make_error (err, errno, "write to file `%s`", attr_path);
+    }
 
   return 0;
 }
@@ -963,9 +1027,12 @@ libcrun_is_apparmor_enabled (libcrun_error_t *err)
 static int
 is_current_process_confined (libcrun_container_t *container, libcrun_error_t *err)
 {
+#define UNCONFINED "unconfined"
+#define UNCONFINED_LEN (ssize_t) (sizeof (UNCONFINED) - 1)
   cleanup_free const char *attr_path = lsm_attr_path (container, "apparmor", "current", err);
   cleanup_close int fd = -1;
-  char buf[256];
+  /* Only the "unconfined" token plus one delimiter byte are inspected.  */
+  char buf[UNCONFINED_LEN + 1];
 
   if (UNLIKELY (attr_path == NULL))
     return -1;
@@ -977,13 +1044,22 @@ is_current_process_confined (libcrun_container_t *container, libcrun_error_t *er
   if (UNLIKELY (check_proc_super_magic (fd, attr_path, err)))
     return -1;
 
-  ssize_t bytes_read = read (fd, buf, sizeof (buf) - 1);
+  ssize_t bytes_read = TEMP_FAILURE_RETRY (read (fd, buf, sizeof (buf)));
   if (UNLIKELY (bytes_read < 0))
     return crun_make_error (err, errno, "read from `%s`", attr_path);
 
-#define UNCONFINED "unconfined"
-#define UNCONFINED_LEN (ssize_t) (sizeof (UNCONFINED) - 1)
-  return bytes_read >= UNCONFINED_LEN && memcmp (buf, UNCONFINED, UNCONFINED_LEN);
+  /* The process is unconfined only when the attribute is exactly the token
+     "unconfined", optionally followed by a delimiter.  Anything shorter (a
+     short read), or a longer profile name such as "unconfined_foo", means the
+     process is confined.  When in doubt default to confined, which is the safe
+     assumption for the caller.  */
+  if (bytes_read < UNCONFINED_LEN || memcmp (buf, UNCONFINED, UNCONFINED_LEN) != 0)
+    return 1;
+  if (bytes_read == UNCONFINED_LEN || buf[UNCONFINED_LEN] == '\n' || buf[UNCONFINED_LEN] == ' ')
+    return 0;
+  return 1;
+#undef UNCONFINED
+#undef UNCONFINED_LEN
 }
 
 int
@@ -1667,7 +1743,7 @@ format_default_id_mapping (char **out, uid_t container_id, uid_t host_uid, uid_t
   if (container_id > 0)
     {
       uint32_t used = MIN (container_id, available);
-      ret = snprintf (buffer + written, remaining, "%d %d %d\n", 0, from, used);
+      ret = snprintf (buffer + written, remaining, "%d %" PRIu32 " %" PRIu32 "\n", 0, from, used);
       if (UNLIKELY (ret >= remaining))
         return crun_make_error (err, 0, "internal error: allocated buffer too small");
 
@@ -1688,7 +1764,7 @@ format_default_id_mapping (char **out, uid_t container_id, uid_t host_uid, uid_t
   /* Last mapping: use any id that is left.  */
   if (available)
     {
-      ret = snprintf (buffer + written, remaining, "%d %d %d\n", container_id + 1, from, available);
+      ret = snprintf (buffer + written, remaining, "%d %" PRIu32 " %" PRIu32 "\n", container_id + 1, from, available);
       if (UNLIKELY (ret >= remaining))
         return crun_make_error (err, 0, "internal error: allocated buffer too small");
       written += ret;
@@ -2432,7 +2508,7 @@ safe_write (int fd, const char *fname, const void *buf, size_t count, libcrun_er
   size_t written = 0;
   while (written < count)
     {
-      ssize_t w = write (fd, buf + written, count - written);
+      ssize_t w = write (fd, (const char *) buf + written, count - written);
       if (UNLIKELY (w < 0))
         {
           if (errno == EINTR || errno == EAGAIN)
@@ -2444,10 +2520,11 @@ safe_write (int fd, const char *fname, const void *buf, size_t count, libcrun_er
   return 0;
 }
 
+#define MAX_PARTS 32
+
 int
 append_paths (char **out, libcrun_error_t *err, ...)
 {
-  const size_t MAX_PARTS = 32;
   const char *parts[MAX_PARTS];
   size_t sizes[MAX_PARTS];
   size_t total_len = 0;
@@ -2596,6 +2673,33 @@ get_user_name (uid_t uid)
   if (! getpwuid_r (uid, &pd, pwdbuffer, sizeof (pwdbuffer), &temp_result_ptr))
     return xstrdup (pd.pw_name);
   return xstrdup ("");
+}
+
+/* Convert a sysctl key to its /proc/sys path according to sysctl.d(5).
+   If the first separator is '/', remaining slashes and dots are left intact.
+   If the first separator is '.', dots and slashes are interchanged.  */
+char *
+libcrun_sysctl_key_to_proc_path (const char *key)
+{
+  const char *sep;
+  char *ret, *it;
+
+  sep = strpbrk (key, "./");
+
+  /* No separator at all, or the key is already in the path form.  */
+  if (sep == NULL || *sep == '/')
+    return xstrdup (key);
+
+  ret = xstrdup (key);
+  for (it = ret; *it; it++)
+    {
+      if (*it == '.')
+        *it = '/';
+      else if (*it == '/')
+        *it = '.';
+    }
+
+  return ret;
 }
 
 int

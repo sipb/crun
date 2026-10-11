@@ -21,6 +21,7 @@
 #include <config.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <string.h>
 #include <errno.h>
 #include <argp.h>
 #include "error.h"
@@ -352,13 +353,20 @@ void get_current_timestamp (char *out, size_t len);
 
 int set_blocking_fd (int fd, bool blocking, libcrun_error_t *err);
 
-int parse_json_file (json_object **out, const char *jsondata, struct parser_context *ctx, libcrun_error_t *err);
+/* Exported for the language bindings (python/, lua/), which parse a
+   process JSON blob before calling libcrun_container_exec.  */
+LIBCRUN_PUBLIC int parse_json_file (json_object **out, const char *jsondata, struct parser_context *ctx, libcrun_error_t *err);
 
 /* Check that the string STR has the prefix PREFIX.  */
 static inline int
 has_prefix (const char *str, const char *prefix)
 {
-  size_t prefix_len = strlen (prefix);
+  size_t prefix_len;
+
+  if (! str || ! prefix)
+    return 0;
+
+  prefix_len = strlen (prefix);
   return strlen (str) >= prefix_len && memcmp (str, prefix, prefix_len) == 0;
 }
 
@@ -366,7 +374,12 @@ has_prefix (const char *str, const char *prefix)
 static inline int
 has_dir_prefix (const char *str, const char *prefix)
 {
-  size_t prefix_len = strlen (prefix);
+  size_t prefix_len;
+
+  if (! str || ! prefix)
+    return 0;
+
+  prefix_len = strlen (prefix);
   return strlen (str) > prefix_len && memcmp (str, prefix, prefix_len) == 0 && str[prefix_len] == '/';
 }
 
@@ -401,6 +414,7 @@ int str2sig (const char *name);
 
 int base64_decode (const char *iptr, size_t isize, char *optr, size_t osize, size_t *nbytes);
 int has_suffix (const char *source, const char *suffix);
+char *libcrun_sysctl_key_to_proc_path (const char *key);
 char *str_join_array (int offset, size_t size, char *const array[], const char *joint);
 
 ssize_t safe_readlinkat (int dfd, const char *name, char **buffer, ssize_t hint, libcrun_error_t *err);
@@ -411,6 +425,13 @@ static inline bool
 is_empty_string (const char *s)
 {
   return s == NULL || s[0] == '\0';
+}
+
+/* Like strlen(), but a NULL string has length 0.  */
+static inline size_t
+safe_strlen (const char *s)
+{
+  return s == NULL ? 0 : strlen (s);
 }
 
 static inline bool
@@ -450,7 +471,7 @@ waitpid_ignore_stopped (pid_t pid, int *status, int options)
       ret = TEMP_FAILURE_RETRY (waitpid (pid, &s, options));
       if (ret < 0)
         return ret;
-  } while (WIFSTOPPED (s) | WIFCONTINUED (s));
+  } while (WIFSTOPPED (s) || WIFCONTINUED (s));
 
   if (status)
     *status = s;

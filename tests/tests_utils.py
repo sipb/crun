@@ -39,8 +39,10 @@ logger = logging.getLogger('crun.tests')
 __all__ = ['logger', 'base_config', 'run_and_get_output', 'run_crun_command', 'run_crun_command_raw',
            'parse_proc_status', 'add_all_namespaces', 'tests_main', 'is_rootless',
            'is_cgroup_v2_unified', 'is_sched_deadline_available', 'get_crun_feature_string', 'running_on_systemd',
+           'systemctl_show',
            'get_tests_root', 'get_tests_root_status', 'get_init_path', 'get_crun_path',
-           'get_cgroup_manager', 'get_test_environment']
+           'get_cgroup_manager', 'get_test_environment', 'wait_for_state',
+           'wait_for_signal_handler']
 
 base_conf = """
 {
@@ -329,7 +331,8 @@ def run_and_get_output(config, detach=False, preserve_fds=None, pid_file=None,
                        keep=False,
                        command='run', env=None, use_popen=False, hide_stderr=False, cgroup_manager=None,
                        all_dev_null=False, stdin_dev_null=False, id_container=None, relative_config_path="config.json",
-                       chown_rootfs_to=None, callback_prepare_rootfs=None, debug=False):
+                       chown_rootfs_to=None, callback_prepare_rootfs=None, debug=False,
+                       bundle_via_symlink=False):
 
     # Some tests require that the container user, which might not be the
     # same user as the person running the tests, is able to resolve the full path
@@ -384,6 +387,17 @@ def run_and_get_output(config, detach=False, preserve_fds=None, pid_file=None,
     if callback_prepare_rootfs is not None:
         callback_prepare_rootfs(rootfs)
 
+    # Run crun from a different directory, passing the bundle as a symlink to
+    # it.  This makes getcwd() in crun differ from the bundle path passed on the
+    # command line, which is what the hooks must report.
+    bundle_arg = []
+    run_cwd = temp_dir
+    if bundle_via_symlink:
+        bundle_link = temp_dir + ".link"
+        os.symlink(temp_dir, bundle_link)
+        bundle_arg = ['--bundle', bundle_link]
+        run_cwd = "/"
+
     detach_arg = ['--detach'] if detach else []
     keep_arg = ['--keep'] if keep else []
     preserve_fds_arg = ['--preserve-fds', str(preserve_fds)] if preserve_fds else []
@@ -396,7 +410,7 @@ def run_and_get_output(config, detach=False, preserve_fds=None, pid_file=None,
         cgroup_manager = get_cgroup_manager()
 
     root = get_tests_root_status()
-    args = [crun] + debug_arg + ["--cgroup-manager", cgroup_manager, "--root", root, command] + relative_config_path + preserve_fds_arg + detach_arg + keep_arg + pid_file_arg + [id_container]
+    args = [crun] + debug_arg + ["--cgroup-manager", cgroup_manager, "--root", root, command] + bundle_arg + relative_config_path + preserve_fds_arg + detach_arg + keep_arg + pid_file_arg + [id_container]
 
     stderr = subprocess.STDOUT
     if hide_stderr:
@@ -415,17 +429,17 @@ def run_and_get_output(config, detach=False, preserve_fds=None, pid_file=None,
     if use_popen:
         if not stdout:
             stdout=subprocess.PIPE
-        return subprocess.Popen(args, cwd=temp_dir,
+        return subprocess.Popen(args, cwd=run_cwd,
                                 umask=default_umask,
                                 stdout=stdout,
                                 stderr=stderr, stdin=stdin, env=env,
                                 close_fds=False), id_container
     else:
         try:
-            return subprocess.check_output(args, cwd=temp_dir, stdin=stdin, stderr=stderr, env=env, close_fds=False, umask=default_umask).decode(), id_container
+            return subprocess.check_output(args, cwd=run_cwd, stdin=stdin, stderr=stderr, env=env, close_fds=False, umask=default_umask).decode(), id_container
         except subprocess.CalledProcessError as e:
             logger.error("Command failed: %s", ' '.join(args))
-            logger.error("Working directory: %s", temp_dir)
+            logger.error("Working directory: %s", run_cwd)
             logger.error("Container ID: %s", id_container)
             logger.error("Return code: %d", e.returncode)
             if e.output:
@@ -460,9 +474,60 @@ def run_crun_command_raw(args):
         logger.error("Return code: %d", e.returncode)
         raise
 
+def wait_for_state(cid, states='running', timeout=5):
+    """Wait for the container to be in one of the given states.
+
+    states is either a single state or a tuple of states.  Return the state of
+    the container once it is in one of them, or None if that did not happen
+    within timeout seconds.
+    """
+    if isinstance(states, str):
+        states = (states,)
+    status_file = os.path.join(get_tests_root_status(), cid, "status")
+    args = [get_crun_path(), "--root", get_tests_root_status(), "state", cid]
+    deadline = time.monotonic() + timeout
+    while True:
+        # Only ask crun once the container is known to it, as it logs an error
+        # for every state command for a container which does not exist yet.
+        if os.path.exists(status_file):
+            r = subprocess.run(args, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, close_fds=False)
+            if r.returncode == 0:
+                state = json.loads(r.stdout)
+                if state['status'] in states:
+                    return state
+        if time.monotonic() >= deadline:
+            return None
+        time.sleep(0.1)
+
+def wait_for_signal_handler(pid, sig, timeout=5):
+    """Wait until the process has a handler for the signal.
+
+    Return False if that did not happen within timeout seconds, or if the
+    process is gone.
+    """
+    bit = 1 << (sig - 1)
+    deadline = time.monotonic() + timeout
+    while True:
+        try:
+            with open("/proc/%d/status" % pid) as f:
+                if int(parse_proc_status(f.read())['SigCgt'], 16) & bit:
+                    return True
+        except FileNotFoundError:
+            return False
+        if time.monotonic() >= deadline:
+            return False
+        time.sleep(0.1)
+
 def running_on_systemd():
     with open('/proc/1/comm') as f:
         return "systemd" in f.readline()
+
+def systemctl_show(unit, prop, user=False):
+    cmd = ['systemctl'] + (['--user'] if user else []) + ['show', '-P', prop, unit]
+    try:
+        return subprocess.check_output(cmd, stderr=subprocess.DEVNULL, close_fds=False).decode().strip()
+    except Exception:
+        return None
 
 def tests_main(all_tests):
     os.environ["LANG"] = "C"

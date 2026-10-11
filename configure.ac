@@ -22,6 +22,36 @@ AC_PROG_SED
 AC_PROG_CC
 AM_PATH_PYTHON(3)
 
+dnl Compiler warnings.  They are not added to CFLAGS, which belongs to the
+dnl user, but to WARN_CFLAGS, that automake puts before CFLAGS so that the
+dnl user can still override any of them.
+AC_ARG_ENABLE([werror],
+	AS_HELP_STRING([--enable-werror], [treat compiler warnings as errors]))
+
+WARN_CFLAGS=
+crun_save_CFLAGS="$CFLAGS"
+for crun_flag in \
+	-Wall \
+	-Wextra \
+	-Wvla \
+	-Walloca \
+	-Wduplicated-cond \
+	-Wduplicated-branches \
+	-Winit-self \
+	-Wshift-overflow=2 ; do
+	AC_MSG_CHECKING([whether $CC accepts $crun_flag])
+	dnl -Werror is needed as clang only warns about the flags it does not know.
+	CFLAGS="$crun_save_CFLAGS $crun_flag -Werror"
+	AC_COMPILE_IFELSE([AC_LANG_PROGRAM([], [])],
+			  [AC_MSG_RESULT([yes])
+			   WARN_CFLAGS="$WARN_CFLAGS $crun_flag"],
+			  [AC_MSG_RESULT([no])])
+done
+CFLAGS="$crun_save_CFLAGS"
+
+AS_IF([test "x$enable_werror" = "xyes"], [WARN_CFLAGS="$WARN_CFLAGS -Werror"])
+AC_SUBST([WARN_CFLAGS])
+
 AC_PATH_PROG(MD2MAN, go-md2man)
 
 AM_CONDITIONAL([HAVE_MD2MAN], [test "x$ac_cv_path_MD2MAN" != x])
@@ -34,15 +64,19 @@ AC_CHECK_FUNCS(eaccess hsearch_r copy_file_range fgetxattr statx fgetpwent_r iss
 
 AC_CHECK_HEADER([error.h], [AC_CHECK_FUNC([error], AC_DEFINE([HAVE_ERROR_H], [1], [Define if error.h is usable]))])
 
+dnl tests/init, the container init used by the python tests, is the only thing
+dnl that has to be linked statically.  The unit tests and the fuzzing harness
+dnl do not care, so a compiler that cannot link statically -- honggfuzz's
+dnl hfuzz-clang, for one -- costs us the python tests, not the whole suite.
 case "${lt_cv_prog_compiler_static_works}" in
-	yes) build_tests=true ;;
+	yes) build_static_tests=true ;;
 	no)
-		AC_MSG_WARN([Static compilation not working. Test suite cannot be built / executed. Make sure to install glibc-static or equivalent.])
-		build_tests=false
+		AC_MSG_WARN([Static compilation not working. tests/init cannot be built, so the tests needing it are skipped. Make sure to install glibc-static or equivalent.])
+		build_static_tests=false
 		;;
 	*) ;;
 esac
-AM_CONDITIONAL([BUILD_TESTS], [test "x${build_tests}" = xtrue])
+AM_CONDITIONAL([BUILD_STATIC_TESTS], [test "x${build_static_tests}" = xtrue])
 
 AC_ARG_ENABLE(crun,
 AS_HELP_STRING([--enable-crun], [Include crun executable in installation (default: yes)]),
@@ -424,6 +458,24 @@ AS_IF([test "x$enable_coverage" = "xyes"], [
 ])
 
 AM_CONDITIONAL([ENABLE_COVERAGE], [test "x$enable_coverage" = "xyes"])
+
+dnl address and undefined behaviour sanitizers
+AC_ARG_ENABLE([sanitizers],
+	AS_HELP_STRING([--enable-sanitizers], [Build with the address and undefined behaviour sanitizers (for testing only)]),
+	[enable_sanitizers=$enableval], [enable_sanitizers=no])
+
+AS_IF([test "x$enable_sanitizers" = "xyes"], [
+	dnl Without -fno-sanitize-recover the undefined behaviour sanitizer only
+	dnl prints what it finds and lets the program carry on, so a test suite
+	dnl run would stay green no matter what it reported.
+	SANITIZER_CFLAGS="-fsanitize=address -fsanitize=undefined -fno-sanitize-recover=undefined -fno-omit-frame-pointer -g"
+	SANITIZER_LDFLAGS="-fsanitize=address -fsanitize=undefined"
+])
+
+dnl Substituted unconditionally, and empty unless --enable-sanitizers was
+dnl given, so that the flags can simply be appended where they are needed.
+AC_SUBST([SANITIZER_CFLAGS])
+AC_SUBST([SANITIZER_LDFLAGS])
 
 AC_SEARCH_LIBS([argp_parse], [argp], [], [AC_MSG_ERROR([*** argp functions not found - install libargp or argp_standalone])])
 

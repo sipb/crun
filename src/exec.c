@@ -89,25 +89,24 @@ static struct argp_option options[]
 static char args_doc[] = "exec CONTAINER cmd";
 
 static void
+append_to_string_array (char ***arr, size_t *size, const char *arg)
+{
+  *arr = xrealloc (*arr, (*size + 2) * sizeof (**arr));
+  (*arr)[*size + 1] = NULL;
+  (*arr)[*size] = xstrdup (arg);
+  (*size)++;
+}
+
+static void
 append_env (const char *arg)
 {
-  exec_options.env = realloc (exec_options.env, (exec_options.env_size + 2) * sizeof (*exec_options.env));
-  if (exec_options.env == NULL)
-    error (EXIT_FAILURE, errno, "cannot allocate memory");
-  exec_options.env[exec_options.env_size + 1] = NULL;
-  exec_options.env[exec_options.env_size] = xstrdup (arg);
-  exec_options.env_size++;
+  append_to_string_array (&exec_options.env, &exec_options.env_size, arg);
 }
 
 static void
 append_cap (const char *arg)
 {
-  exec_options.cap = realloc (exec_options.cap, (exec_options.cap_size + 2) * sizeof (*exec_options.cap));
-  if (exec_options.cap == NULL)
-    error (EXIT_FAILURE, errno, "cannot allocate memory");
-  exec_options.cap[exec_options.cap_size + 1] = NULL;
-  exec_options.cap[exec_options.cap_size] = xstrdup (arg);
-  exec_options.cap_size++;
+  append_to_string_array (&exec_options.cap, &exec_options.cap_size, arg);
 }
 
 static char **
@@ -152,7 +151,7 @@ parse_opt (int key, char *arg, struct argp_state *state)
       break;
 
     case OPTION_PRESERVE_FDS:
-      exec_options.preserve_fds = parse_int_or_fail (argp_mandatory_argument (arg, state), "preserve-fds");
+      exec_options.preserve_fds = parse_id_or_fail (argp_mandatory_argument (arg, state), NULL, "preserve-fds");
       break;
 
     case OPTION_CGROUP:
@@ -205,38 +204,21 @@ make_oci_process_user (const char *userspec)
   runtime_spec_schema_config_schema_process_user *u;
   char *endptr = NULL;
   char *gidstr = NULL;
-  long long l;
 
   if (userspec == NULL)
     return NULL;
 
   u = xmalloc0 (sizeof (runtime_spec_schema_config_schema_process_user));
-  errno = 0;
-  l = strtoll (userspec, &endptr, 10);
-  if (endptr == userspec)
-    libcrun_fail_with_error (0, "invalid UID specified");
-  if (errno == ERANGE)
-    libcrun_fail_with_error (0, "invalid UID specified");
-  if (l < INT_MIN || l > INT_MAX)
-    libcrun_fail_with_error (0, "invalid UID specified");
-  u->uid = (int) l;
+  u->uid = parse_id_or_fail (userspec, &endptr, "UID");
   if (*endptr == '\0')
     return u;
   if (*endptr != ':')
     libcrun_fail_with_error (0, "invalid USERSPEC specified");
 
-  errno = 0;
   gidstr = endptr + 1;
-  l = strtoll (gidstr, &endptr, 10);
-  if (endptr == gidstr)
-    libcrun_fail_with_error (0, "invalid GID specified");
-  if (errno == ERANGE)
-    libcrun_fail_with_error (0, "invalid GID specified");
-  if (l < INT_MIN || l > INT_MAX)
-    libcrun_fail_with_error (0, "invalid GID specified");
+  u->gid = parse_id_or_fail (gidstr, &endptr, "GID");
   if (*endptr != '\0')
     libcrun_fail_with_error (0, "invalid USERSPEC specified");
-  u->gid = (int) l;
   return u;
 }
 
@@ -295,9 +277,10 @@ crun_command_exec (struct crun_global_arguments *global_args, int argc, char **a
       process = xmalloc0 (sizeof (*process));
       int i;
 
-      process->args_len = argc;
-      process->args = xmalloc0 ((argc + 1) * sizeof (*process->args));
-      for (i = 0; i < argc - first_arg; i++)
+      /* argv[first_arg] is the container id, the command follows it.  */
+      process->args_len = argc - first_arg - 1;
+      process->args = xmalloc0 ((process->args_len + 1) * sizeof (*process->args));
+      for (i = 0; i < (int) process->args_len; i++)
         process->args[i] = xstrdup (argv[first_arg + i + 1]);
       process->args[i] = NULL;
       if (exec_options.cwd)
@@ -317,7 +300,7 @@ crun_command_exec (struct crun_global_arguments *global_args, int argc, char **a
       if (exec_options.cap_size > 0)
         {
           runtime_spec_schema_config_schema_process_capabilities *capabilities
-              = xmalloc (sizeof (runtime_spec_schema_config_schema_process_capabilities));
+              = xmalloc0 (sizeof (runtime_spec_schema_config_schema_process_capabilities));
 
           capabilities->effective = exec_options.cap;
           capabilities->effective_len = exec_options.cap_size;

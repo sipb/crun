@@ -106,6 +106,9 @@ is_rwm (const char *str, libcrun_error_t *err)
   bool w = false;
   bool m = false;
 
+  if (str == NULL)
+    str = "";
+
   for (it = str; *it; it++)
     switch (*it)
       {
@@ -482,7 +485,7 @@ write_network_resources (int dirfd_netclass, int dirfd_netprio, runtime_spec_sch
   int ret;
   if (net->class_id)
     {
-      len = snprintf (fmt_buf, sizeof (fmt_buf), "%d", net->class_id);
+      len = snprintf (fmt_buf, sizeof (fmt_buf), "%" PRIu32, net->class_id);
       if (UNLIKELY (len >= (int) sizeof (fmt_buf)))
         return crun_make_error (err, 0, "internal error: static buffer too small");
 
@@ -500,7 +503,8 @@ write_network_resources (int dirfd_netclass, int dirfd_netprio, runtime_spec_sch
 
       for (i = 0; i < net->priorities_len; i++)
         {
-          len = snprintf (fmt_buf, sizeof (fmt_buf), "%s %d\n", net->priorities[i]->name, net->priorities[i]->priority);
+          len = snprintf (fmt_buf, sizeof (fmt_buf), "%s %" PRIu32 "\n", net->priorities[i]->name,
+                          net->priorities[i]->priority);
           if (UNLIKELY (len >= (int) sizeof (fmt_buf)))
             return crun_make_error (err, 0, "internal error: static buffer too small");
 
@@ -583,8 +587,10 @@ write_devices_resources_v1 (int dirfd, runtime_spec_schema_defs_linux_device_cgr
           FMT_DEV (devs[i]->minor, fmt_buf_minor);
 #undef FMT_DEV
 
+          /* `access` is optional, and libocispec leaves it NULL when it is not
+             specified.  Printing a NULL pointer with %s is undefined.  */
           len = snprintf (fmt_buf, FMT_BUF_LEN, "%s %s:%s %s", devs[i]->type, fmt_buf_major, fmt_buf_minor,
-                          devs[i]->access);
+                          devs[i]->access ? devs[i]->access : "");
           if (UNLIKELY (len >= FMT_BUF_LEN))
             return crun_make_error (err, 0, "internal error: static buffer too small");
         }
@@ -1033,7 +1039,7 @@ static int
 write_cpu_resources (int dirfd_cpu, bool cgroup2, runtime_spec_schema_config_linux_resources_cpu *cpu,
                      libcrun_error_t *err)
 {
-  int len, period_len;
+  int len, period_len = 0;
   int ret;
   char fmt_buf[64];
   int64_t period = -1;

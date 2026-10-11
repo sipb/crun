@@ -200,6 +200,8 @@ libcrun_handler_manager_load_directory (struct custom_handler_manager_s *manager
     }
   return 0;
 #else
+  (void) manager;
+  (void) path;
   return crun_make_error (err, ENOTSUP, "dlopen not available");
 #endif
 }
@@ -283,6 +285,7 @@ libcrun_configure_handler (struct custom_handler_manager_s *manager,
 {
   const char *explicit_handler;
   const char *annotation;
+  int ret;
 
   *out = NULL;
 
@@ -315,13 +318,21 @@ libcrun_configure_handler (struct custom_handler_manager_s *manager,
         {
           *out = make_custom_handler_instance_s (h);
           if ((*out)->vtable->load)
-            return (*out)->vtable->load (&((*out)->cookie), err);
-          return 0;
+            ret = (*out)->vtable->load (&((*out)->cookie), err);
+          else
+            ret = 0;
+          goto out;
         }
     }
 
   if (manager == NULL)
     return 0;
 
-  return find_handler_for_container (manager, container, out, err);
+  ret = find_handler_for_container (manager, container, out, err);
+
+out:
+  if (ret == 0 && *out != NULL && container->context != NULL && ! (*out)->vtable->supports_open_tree_namespace)
+    container->context->no_open_tree_namespace = true;
+
+  return ret;
 }

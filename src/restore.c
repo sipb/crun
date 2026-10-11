@@ -72,7 +72,7 @@ static struct argp_option options[]
           "path to a socket that will receive the ptmx end of the tty", 0 },
         { "file-locks", OPTION_FILE_LOCKS, 0, 0, "allow file locks", 0 },
         { "manage-cgroups-mode", OPTION_MANAGE_CGROUPS_MODE, "MODE", 0, "cgroups mode: 'soft' (default), 'ignore', 'full' and 'strict'", 0 },
-        { "network-lock", OPTION_NETWORK_LOCK_METHOD, 0, 0, "set network lock method", 0 },
+        { "network-lock", OPTION_NETWORK_LOCK_METHOD, "METHOD", 0, "set network lock method", 0 },
         { "lsm-profile", OPTION_LSM_PROFILE, "VALUE", 0, "Specify an LSM profile to be used during restore in the form of TYPE:NAME", 0 },
         { "lsm-mount-context", OPTION_LSM_MOUNT_CONTEXT, "VALUE", 0, "Specify an LSM mount context to be used during restore", 0 },
         {
@@ -166,6 +166,8 @@ crun_command_restore (struct crun_global_arguments *global_args, int argc, char 
   int first_arg;
   int ret;
 
+  cr_options.manage_cgroups_mode = -1;
+
   argp_parse (&run_argp, argc, argv, ARGP_IN_ORDER, &first_arg, &cr_options);
   crun_assert_n_args (argc - first_arg, 1, 2);
 
@@ -195,8 +197,6 @@ crun_command_restore (struct crun_global_arguments *global_args, int argc, char 
   ret = init_libcrun_context (&crun_context, argv[first_arg], global_args, err);
   if (UNLIKELY (ret < 0))
     return ret;
-
-  cr_options.manage_cgroups_mode = -1;
 
   if (cr_options.image_path == NULL)
     {

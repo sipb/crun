@@ -28,6 +28,7 @@
 #include <dirent.h>
 #include <fcntl.h>
 #include <time.h>
+#include <signal.h>
 #include <sys/types.h>
 #include <sys/wait.h>
 #include <sys/socket.h>
@@ -308,8 +309,9 @@ sd_notify ()
     error (EXIT_FAILURE, errno, "socket");
 
   notify_socket_unix_name.sun_family = AF_UNIX;
-  strncpy (notify_socket_unix_name.sun_path, notify_socket_name,
-           sizeof (notify_socket_unix_name.sun_path));
+  if (strlen (notify_socket_name) >= sizeof (notify_socket_unix_name.sun_path))
+    error (EXIT_FAILURE, 0, "NOTIFY_SOCKET is too long");
+  strcpy (notify_socket_unix_name.sun_path, notify_socket_name);
 
   ret = sendto (notify_socket_fd, ready_data, ready_data_len, 0,
                 (struct sockaddr *) &notify_socket_unix_name, sizeof (notify_socket_unix_name));
@@ -324,6 +326,16 @@ static int
 syscall_seccomp (unsigned int operation, unsigned int flags, void *args)
 {
   return (int) syscall (__NR_seccomp, operation, flags, args);
+}
+
+/* Exit status used by the "exit-on-signal" mode below.  */
+#define SIGNAL_EXIT_STATUS 42
+
+static void
+handle_signal (int signum)
+{
+  (void) signum;
+  _exit (SIGNAL_EXIT_STATUS);
 }
 
 static void
@@ -343,27 +355,25 @@ do_pause ()
 static int
 memhog (int megabytes)
 {
+  size_t page_size, size, pos;
   char *buf;
-  int pos = 0;
 
   if (megabytes < 1)
     error (EXIT_FAILURE, 0, "memhog argument needs to be at least 1");
 
-  buf = malloc (megabytes * 1024 * 1024);
+  page_size = (size_t) sysconf (_SC_PAGESIZE);
+  size = (size_t) megabytes * 1024 * 1024;
+
+  buf = malloc (size);
   if (buf == NULL)
     error (EXIT_FAILURE, 0, "malloc");
 
   close (1);
   close (2);
 
-  while (1)
-    {
-      /* write each page once */
-      buf[pos] = 'c';
-      pos += sysconf (_SC_PAGESIZE);
-      if (pos > megabytes * 1024 * 1024)
-        break;
-    }
+  /* write each page once */
+  for (pos = 0; pos < size; pos += page_size)
+    buf[pos] = 'c';
 
   pos = 0;
 
@@ -372,8 +382,8 @@ memhog (int megabytes)
       /* change one page each 0.1 seconds */
       nanosleep ((const struct timespec[]) { { 0, 100000000L } }, NULL);
       buf[pos] = 'c';
-      pos += sysconf (_SC_PAGESIZE);
-      if (pos > megabytes * 1024 * 1024)
+      pos += page_size;
+      if (pos >= size)
         pos = 0;
     }
 
@@ -404,6 +414,7 @@ dump_net_interface (const char *ifname)
   if (buffer == NULL)
     error (EXIT_FAILURE, errno, "malloc");
 
+  memset (&sa, 0, sizeof (sa));
   sa.nl_family = AF_NETLINK;
 
   if (bind (sock, (struct sockaddr *) &sa, sizeof (sa)) < 0)
@@ -441,7 +452,7 @@ dump_net_interface (const char *ifname)
             error (EXIT_FAILURE, 0, "netlink error");
 
           ifa = NLMSG_DATA (nlh);
-          if (ifa->ifa_index != ifindex)
+          if (ifa->ifa_index != (unsigned int) ifindex)
             continue;
 
           rta_it = IFA_RTA (ifa);
@@ -454,10 +465,11 @@ dump_net_interface (const char *ifname)
               rta_it = RTA_NEXT (rta_it, rta_len);
             }
 
-          if (rta[IFA_ADDRESS])
+          if (rta[IFA_LOCAL] || rta[IFA_ADDRESS])
             {
+              struct rtattr *attr = rta[IFA_LOCAL] ? rta[IFA_LOCAL] : rta[IFA_ADDRESS];
               char addr[INET_ADDRSTRLEN];
-              inet_ntop (AF_INET, RTA_DATA (rta[IFA_LOCAL]), addr, sizeof (addr));
+              inet_ntop (AF_INET, RTA_DATA (attr), addr, sizeof (addr));
               printf ("address: %s/%d\n", addr, ifa->ifa_prefixlen);
             }
           if (rta[IFA_BROADCAST])
@@ -500,11 +512,30 @@ main (int argc, char **argv)
       exit (0);
     }
 
+  if (strcmp (argv[1], "socket") == 0)
+    {
+      int fd;
+
+      if (argc < 3)
+        error (EXIT_FAILURE, 0, "'socket' requires an argument");
+
+      fd = socket (atoi (argv[2]), SOCK_DGRAM, 0);
+      if (fd < 0)
+        error (EXIT_FAILURE, errno, "socket");
+      close (fd);
+      return 0;
+    }
+
   if (strcmp (argv[1], "printenv") == 0)
     {
+      const char *value;
+
       if (argc < 3)
         error (EXIT_FAILURE, 0, "'printenv' requires an argument");
-      fputs (getenv (argv[2]), stdout);
+      value = getenv (argv[2]);
+      if (value == NULL)
+        error (EXIT_FAILURE, 0, "environment variable `%s` is not set", argv[2]);
+      fputs (value, stdout);
       exit (0);
     }
 
@@ -768,7 +799,7 @@ main (int argc, char **argv)
 
   if (strcmp (argv[1], "ip") == 0)
     {
-      if (argc < 2)
+      if (argc < 3)
         error (EXIT_FAILURE, 0, "'ip' requires an argument");
       dump_net_interface (argv[2]);
       exit (EXIT_SUCCESS);
@@ -776,13 +807,22 @@ main (int argc, char **argv)
 
   if (strcmp (argv[1], "write") == 0)
     {
-      if (argc < 3)
+      if (argc < 4)
         error (EXIT_FAILURE, 0, "'write' requires two arguments");
       write_to (argv[2], argv[3]);
       exit (EXIT_SUCCESS);
     }
   if (strcmp (argv[1], "pause") == 0)
     {
+      do_pause ();
+    }
+  if (strcmp (argv[1], "exit-on-signal") == 0)
+    {
+      /* Exit with a distinctive status once SIGUSR1 is received.  Unlike a
+         signal with a default disposition, this works for a PID 1 as well,
+         since the kernel does not apply the default disposition to it.  */
+      if (signal (SIGUSR1, handle_signal) == SIG_ERR)
+        error (EXIT_FAILURE, errno, "signal SIGUSR1");
       do_pause ();
     }
   if (strcmp (argv[1], "memhog") == 0)
@@ -837,7 +877,10 @@ main (int argc, char **argv)
           if (pid < 0)
             error (EXIT_FAILURE, errno, "fork");
           if (pid == 0)
-            sleep (100);
+            {
+              sleep (100);
+              _exit (EXIT_SUCCESS);
+            }
         }
 
       return 0;

@@ -117,7 +117,7 @@ libcrun_cgroup_is_container_paused (struct libcrun_cgroup_status *status, bool *
   int cgroup_mode;
   int ret;
 
-  if (cgroup_path == NULL || cgroup_path[0] == '\0')
+  if (cgroup_path == NULL)
     return 0;
 
   cgroup_mode = libcrun_get_cgroup_mode (err);
@@ -180,6 +180,46 @@ libcrun_cgroup_is_container_paused (struct libcrun_cgroup_status *status, bool *
     }
 
   *paused = strstr (content, state) != NULL;
+  return 0;
+}
+
+int
+libcrun_cgroup_join_process (struct libcrun_cgroup_status *status, const char *path, pid_t pid, pid_t init_pid,
+                             libcrun_error_t *err)
+{
+  struct libcrun_cgroup_manager *cgroup_manager;
+  libcrun_error_t tmp_err = NULL;
+  int errno_;
+  int ret;
+
+  ret = libcrun_move_process_to_cgroup (pid, init_pid, path, false, err);
+  if (LIKELY (ret >= 0))
+    return ret;
+
+  /* Moving a process requires write access to cgroup.procs of the common
+     ancestor of the source and the destination cgroups, which the caller
+     may lack.  See if the cgroup manager can do it instead.  */
+  errno_ = crun_error_get_errno (err);
+  if (errno_ != EACCES && errno_ != EPERM)
+    return ret;
+
+  if (get_cgroup_manager (status->manager, &cgroup_manager, &tmp_err) < 0)
+    {
+      crun_error_release (&tmp_err);
+      return ret;
+    }
+  if (cgroup_manager->attach_process == NULL)
+    return ret;
+
+  if (UNLIKELY (cgroup_manager->attach_process (status, path, pid, &tmp_err) < 0))
+    {
+      /* Report the original error, as it is more relevant.  */
+      libcrun_debug ("Cannot attach pid %d to cgroup `%s`: %s", pid, path, tmp_err->msg);
+      crun_error_release (&tmp_err);
+      return ret;
+    }
+
+  crun_error_release (err);
   return 0;
 }
 
@@ -359,20 +399,31 @@ libcrun_cgroup_enter (struct libcrun_cgroup_args *args, struct libcrun_cgroup_st
         {
           ret = chown_cgroups (status->path, root_uid, root_gid, err);
           if (UNLIKELY (ret < 0))
-            return ret;
+            goto fail_destroy;
         }
 
       if (args->resources)
         {
           ret = update_cgroup_resources (status->path, args->state_root, args->resources, ! status->bpf_dev_set, err);
           if (UNLIKELY (ret < 0))
-            return ret;
+            goto fail_destroy;
         }
     }
 success:
   *out = status;
   status = NULL;
   return 0;
+
+fail_destroy:
+  /* The cgroup is created, but the caller does not get its status, so it
+     cannot destroy it.  Do it here, so it is not left behind.  */
+  {
+    libcrun_error_t tmp_err = NULL;
+
+    if (UNLIKELY (cgroup_manager->destroy_cgroup (status, &tmp_err) < 0))
+      crun_error_release (&tmp_err);
+  }
+  return ret;
 }
 
 int
@@ -558,10 +609,10 @@ libcrun_cgroup_make_status (libcrun_container_status_t *status)
 
   ret = xmalloc0 (sizeof *ret);
 
-  if (status->cgroup_path)
+  if (! is_empty_string (status->cgroup_path))
     ret->path = xstrdup (status->cgroup_path);
 
-  if (status->scope)
+  if (! is_empty_string (status->scope))
     ret->scope = xstrdup (status->scope);
 
   if (is_empty_string (status->cgroup_path) && is_empty_string (status->scope))

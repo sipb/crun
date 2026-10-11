@@ -83,9 +83,12 @@ maybe_make_cgroup_threaded (const char *path, libcrun_error_t *err)
   char *it;
   int ret;
 
+  if (path == NULL)
+    return 0;
+
   path = consume_slashes (path);
 
-  if (path == NULL || path[0] == '\0')
+  if (path[0] == '\0')
     return 0;
 
   ret = append_paths (&cgroup_path_type, err, CGROUP_ROOT, path, "cgroup.type", NULL);
@@ -305,7 +308,13 @@ read_pids_cgroup (int dfd, bool recurse, pid_t **pids, size_t *n_pids, size_t *a
 
   tasksfd = openat (dfd, "cgroup.procs", O_RDONLY | O_CLOEXEC);
   if (tasksfd < 0)
-    return crun_make_error (err, errno, "open `cgroup.procs`");
+    {
+      /* The cgroup was removed concurrently (e.g. while killing the
+         container), there are no processes left to account for.  */
+      if (errno == ENOENT || errno == ENODEV)
+        return 0;
+      return crun_make_error (err, errno, "open `cgroup.procs`");
+    }
 
   ret = read_all_fd (tasksfd, "cgroup.procs", &buffer, &len, err);
   if (UNLIKELY (ret < 0))
@@ -539,6 +548,12 @@ destroy_cgroup_path (const char *path, int mode, libcrun_error_t *err)
   const int max_attempts = 500;
   int ret;
 
+  /* Without a path there is nothing to destroy.  Bail out early, since
+     append_paths() stops at the first NULL argument and would otherwise
+     be left pointing at the cgroup root.  */
+  if (is_empty_string (path))
+    return 0;
+
   do
     {
       repeat = false;
@@ -726,9 +741,57 @@ libcrun_cgroup_pause_unpause_path (const char *cgroup_path, const bool pause, li
   return libcrun_cgroup_pause_unpause_with_mode (cgroup_path, cgroup_mode, pause, err);
 }
 
+/* Fail if the cgroup at CGROUP_PATH exists and is frozen: a process in a
+   frozen cgroup cannot make any progress, so the container creation would
+   hang forever.  */
+int
+libcrun_cgroup_ensure_not_frozen (const char *cgroup_path, libcrun_error_t *err)
+{
+  cleanup_free char *content = NULL;
+  cleanup_free char *path = NULL;
+  const char *frozen;
+  int cgroup_mode;
+  int ret;
+
+  cgroup_mode = libcrun_get_cgroup_mode (err);
+  if (UNLIKELY (cgroup_mode < 0))
+    return cgroup_mode;
+
+  if (cgroup_mode == CGROUP_MODE_UNIFIED)
+    {
+      frozen = "1";
+      ret = append_paths (&path, err, CGROUP_ROOT, cgroup_path, "cgroup.freeze", NULL);
+    }
+  else
+    {
+      frozen = "FROZEN";
+      ret = append_paths (&path, err, CGROUP_ROOT "/freezer", cgroup_path, "freezer.state", NULL);
+    }
+  if (UNLIKELY (ret < 0))
+    return ret;
+
+  ret = read_all_file (path, &content, NULL, err);
+  if (UNLIKELY (ret < 0))
+    {
+      /* Either the cgroup does not exist yet, or there is no freezer.  */
+      if (crun_error_get_errno (err) == ENOENT)
+        {
+          crun_error_release (err);
+          return 0;
+        }
+      return ret;
+    }
+
+  if (strstr (content, frozen))
+    return crun_make_error (err, 0, "container's cgroup unexpectedly frozen");
+
+  return 0;
+}
+
 int
 cgroup_killall_path (const char *path, int signal, libcrun_error_t *err)
 {
+  bool frozen = false;
   int ret;
   size_t i;
   cleanup_free pid_t *pids = NULL;
@@ -752,15 +815,20 @@ cgroup_killall_path (const char *path, int signal, libcrun_error_t *err)
       crun_error_release (err);
     }
 
+  /* Freeze the cgroup so that the processes cannot fork while they are being
+     killed.  Once frozen, make sure the cgroup is always thawed again on any
+     exit path, otherwise the container would be left frozen and unresponsive.  */
   ret = libcrun_cgroup_pause_unpause_path (path, true, err);
   if (UNLIKELY (ret < 0))
     crun_error_release (err);
+  else
+    frozen = true;
 
   ret = libcrun_cgroup_read_pids_from_path (path, true, &pids, err);
   if (UNLIKELY (ret < 0))
     {
       if (crun_error_get_errno (err) != ENOENT)
-        return ret;
+        goto thaw;
 
       /* If the file doesn't exist then the container was already killed.  */
       crun_error_release (err);
@@ -770,14 +838,26 @@ cgroup_killall_path (const char *path, int signal, libcrun_error_t *err)
     {
       ret = kill (pids[i], signal);
       if (UNLIKELY (ret < 0 && errno != ESRCH))
-        return crun_make_error (err, errno, "kill process `%d`", pids[i]);
+        {
+          ret = crun_make_error (err, errno, "kill process `%d`", pids[i]);
+          goto thaw;
+        }
     }
 
-  ret = libcrun_cgroup_pause_unpause_path (path, false, err);
-  if (UNLIKELY (ret < 0))
-    crun_error_release (err);
+  ret = 0;
 
-  return 0;
+thaw:
+  if (frozen)
+    {
+      libcrun_error_t thaw_err = NULL;
+
+      /* Thawing is best-effort: do not clobber a pending error with a
+         thaw failure, but never leave the cgroup frozen.  */
+      if (libcrun_cgroup_pause_unpause_path (path, false, &thaw_err) < 0)
+        crun_error_release (&thaw_err);
+    }
+
+  return ret;
 }
 
 static int
@@ -1004,6 +1084,66 @@ libcrun_move_process_to_cgroup (pid_t pid, pid_t init_pid, const char *path, boo
   return enter_cgroup (cgroup_mode, pid, init_pid, path, create_if_missing, err);
 }
 
+/* Move the current process to the cgroups listed in CONTENT, as read from
+   /proc/self/cgroup earlier.  Used to undo libcrun_move_process_to_cgroup.  */
+int
+libcrun_move_self_to_cgroups (const char *content, libcrun_error_t *err)
+{
+  cleanup_free char *buf = xstrdup (content);
+  char *saveptr = NULL;
+  char *controller;
+  char *path;
+  int cgroup_mode;
+  bool has_data;
+  int ret;
+
+  cgroup_mode = libcrun_get_cgroup_mode (err);
+  if (UNLIKELY (cgroup_mode < 0))
+    return cgroup_mode;
+
+  for (has_data = read_proc_cgroup (buf, &saveptr, NULL, &controller, &path);
+       has_data;
+       has_data = read_proc_cgroup (NULL, &saveptr, NULL, &controller, &path))
+    {
+      const char *subsystem = NULL;
+
+      if (cgroup_mode == CGROUP_MODE_UNIFIED)
+        {
+          /* Ignore named v1 hierarchies, if any.  */
+          if (controller[0] != '\0')
+            continue;
+        }
+      else
+        {
+          cleanup_free char *subsystem_path = NULL;
+
+          /* Use the same names as enter_cgroup_v1 does.  */
+          if (has_prefix (controller, "name="))
+            controller += 5;
+          subsystem = controller[0] == '\0' ? "unified" : controller;
+          if (strcmp (subsystem, "net_prio,net_cls") == 0)
+            subsystem = "net_cls,net_prio";
+          if (strcmp (subsystem, "cpuacct,cpu") == 0)
+            subsystem = "cpu,cpuacct";
+
+          ret = append_paths (&subsystem_path, err, CGROUP_ROOT, subsystem, NULL);
+          if (UNLIKELY (ret < 0))
+            return ret;
+          ret = crun_path_exists (subsystem_path, err);
+          if (UNLIKELY (ret < 0))
+            return ret;
+          if (ret == 0)
+            continue;
+        }
+
+      ret = move_process_to_cgroup (0, subsystem, path, err);
+      if (UNLIKELY (ret < 0))
+        return ret;
+    }
+
+  return 0;
+}
+
 int
 libcrun_get_cgroup_dirfd (struct libcrun_cgroup_status *status, const char *sub_cgroup, libcrun_error_t *err)
 {
@@ -1050,13 +1190,16 @@ libcrun_migrate_all_pids_to_cgroup (pid_t init_pid, char *from, char *to, libcru
   if (cgroup_mode < 0)
     return cgroup_mode;
 
+  /* Freeze the source cgroup for a consistent view of its processes while they
+     are migrated, but make sure it is always thawed again on error, otherwise
+     it would be left frozen.  */
   ret = libcrun_cgroup_pause_unpause_path (from, true, err);
   if (UNLIKELY (ret < 0))
     return ret;
 
   ret = libcrun_cgroup_read_pids_from_path (from, true, &pids, err);
   if (UNLIKELY (ret < 0))
-    return ret;
+    goto thaw;
 
   from_len = strlen (from);
 
@@ -1067,18 +1210,34 @@ libcrun_migrate_all_pids_to_cgroup (pid_t init_pid, char *from, char *to, libcru
 
       ret = libcrun_get_cgroup_process (pids[i], &pid_path, false, err);
       if (UNLIKELY (ret < 0))
-        return ret;
+        goto thaw;
 
       /* Make sure the pid is in the cgroup we are migrating from.  */
       if (! has_prefix (pid_path, from))
-        return crun_make_error (err, 0, "error migrating pid %d.  It is not in the cgroup `%s`", pids[i], from);
+        {
+          ret = crun_make_error (err, 0, "error migrating pid %d.  It is not in the cgroup `%s`", pids[i], from);
+          goto thaw;
+        }
 
       /* Build the destination cgroup path, keeping the same hierarchy.  */
       xasprintf (&dest_cgroup, "%s%s", to, pid_path + from_len);
 
       ret = enter_cgroup (cgroup_mode, pids[i], init_pid, dest_cgroup, false, err);
       if (UNLIKELY (ret < 0))
-        return ret;
+        goto thaw;
+    }
+
+  ret = 0;
+
+thaw:
+  if (UNLIKELY (ret < 0))
+    {
+      libcrun_error_t thaw_err = NULL;
+
+      /* Best-effort thaw: keep the original error but never leave the cgroup frozen.  */
+      if (libcrun_cgroup_pause_unpause_path (from, false, &thaw_err) < 0)
+        crun_error_release (&thaw_err);
+      return ret;
     }
 
   ret = libcrun_cgroup_pause_unpause_path (from, false, err);

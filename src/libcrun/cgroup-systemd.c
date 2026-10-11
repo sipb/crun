@@ -167,6 +167,11 @@ setup_rt_runtime (runtime_spec_schema_config_linux_resources *resources,
   if (resources == NULL || resources->cpu == NULL)
     return 0;
 
+  /* Without a cgroup path append_paths() below would end up at the cgroup
+     root, so refuse rather than change the root cgroup settings.  */
+  if (is_empty_string (path))
+    return crun_make_error (err, 0, "cannot set the RT runtime without a cgroup");
+
   if (has_suffix (path, ".scope"))
     need_set_parent = false;
 
@@ -300,6 +305,18 @@ setup_cpuset_for_systemd_v1 (runtime_spec_schema_config_linux_resources *resourc
   return 0;
 }
 
+/* Build PATH from the cgroup slice FROM, appending SUFFIX when set.  */
+static int
+compute_finalized_path (char **path, const char *from, const char *suffix, libcrun_error_t *err)
+{
+  if (suffix == NULL)
+    {
+      *path = xstrdup (from);
+      return 0;
+    }
+  return append_paths (path, err, from, suffix, NULL);
+}
+
 static int
 systemd_finalize (struct libcrun_cgroup_args *args, char **path_out,
                   int cgroup_mode, const char *suffix, libcrun_error_t *err)
@@ -344,15 +361,10 @@ systemd_finalize (struct libcrun_cgroup_args *args, char **path_out,
       if (UNLIKELY (to == NULL))
         return crun_make_error (err, 0, "cannot parse `%s`", PROC_SELF_CGROUP);
       *to = '\0';
-      if (suffix == NULL)
-        path = xstrdup (from);
-      else
-        {
-          ret = append_paths (&path, err, from, suffix, NULL);
-          if (UNLIKELY (ret < 0))
-            return ret;
-        }
+      ret = compute_finalized_path (&path, from, suffix, err);
       *to = '\n';
+      if (UNLIKELY (ret < 0))
+        return ret;
 
       if (geteuid ())
         return 0;
@@ -411,15 +423,10 @@ systemd_finalize (struct libcrun_cgroup_args *args, char **path_out,
         if (UNLIKELY (to == NULL))
           return crun_make_error (err, 0, "cannot parse `%s`", PROC_SELF_CGROUP);
         *to = '\0';
-        if (suffix == NULL)
-          path = xstrdup (from);
-        else
-          {
-            ret = append_paths (&path, err, from, suffix, NULL);
-            if (UNLIKELY (ret < 0))
-              return ret;
-          }
+        ret = compute_finalized_path (&path, from, suffix, err);
         *to = '\n';
+        if (UNLIKELY (ret < 0))
+          return ret;
 
         ret = append_paths (&dir, err, CGROUP_ROOT, path, NULL);
         if (UNLIKELY (ret < 0))
@@ -1326,9 +1333,6 @@ append_devices (sd_bus_message *m,
         return ret;
     }
 
-  if (resources == NULL)
-    return 0;
-
   for (i = find_first_rule_no_default (resources->devices, resources->devices_len); i < resources->devices_len; i++)
     {
       runtime_spec_schema_defs_linux_device_cgroup *d = resources->devices[i];
@@ -1382,7 +1386,7 @@ has_bpf_fs ()
 {
   struct statfs stat;
 
-  return statfs (SYS_FS_BPF, &stat) == 0 && (stat.f_type == BPF_FS_MAGIC);
+  return statfs (SYS_FS_BPF, &stat) == 0 && (stat.f_type == (typeof (stat.f_type)) BPF_FS_MAGIC);
 }
 
 static int
@@ -1729,6 +1733,21 @@ verify_ebpf_device_filter_installed (const char *cgroup_path, libcrun_error_t *e
   return 0;
 }
 
+/* Release the sd-bus objects used by a D-Bus call and return RET.  */
+static int
+cleanup_sd_bus_and_return (sd_bus *bus, sd_bus_message *m, sd_bus_message *reply,
+                           sd_bus_error *error, int ret)
+{
+  if (bus)
+    sd_bus_unref (bus);
+  if (m)
+    sd_bus_message_unref (m);
+  if (reply)
+    sd_bus_message_unref (reply);
+  sd_bus_error_free (error);
+  return ret;
+}
+
 static int
 enter_systemd_cgroup_scope (runtime_spec_schema_config_linux_resources *resources,
                             int cgroup_mode,
@@ -1933,14 +1952,7 @@ enter_systemd_cgroup_scope (runtime_spec_schema_config_linux_resources *resource
   ret = systemd_check_job_status (bus, &job_data, object, "creating", err);
 
 exit:
-  if (bus)
-    sd_bus_unref (bus);
-  if (m)
-    sd_bus_message_unref (m);
-  if (reply)
-    sd_bus_message_unref (reply);
-  sd_bus_error_free (&error);
-  return ret;
+  return cleanup_sd_bus_and_return (bus, m, reply, &error, ret);
 }
 
 static int
@@ -1999,14 +2011,7 @@ libcrun_destroy_systemd_cgroup_scope (struct libcrun_cgroup_status *cgroup_statu
   reset_failed_unit (bus, scope);
 
 exit:
-  if (bus)
-    sd_bus_unref (bus);
-  if (m)
-    sd_bus_message_unref (m);
-  if (reply)
-    sd_bus_message_unref (reply);
-  sd_bus_error_free (&error);
-  return ret;
+  return cleanup_sd_bus_and_return (bus, m, reply, &error, ret);
 }
 
 static const char *
@@ -2032,6 +2037,7 @@ libcrun_cgroup_enter_systemd (struct libcrun_cgroup_args *args,
 {
   runtime_spec_schema_config_linux_resources *resources = args->resources;
   const char *cgroup_path = args->cgroup_path;
+  cleanup_free char *scope_path = NULL;
   cleanup_free char *scope = NULL;
   cleanup_free char *path = NULL;
   cleanup_free char *slice = NULL;
@@ -2080,25 +2086,31 @@ libcrun_cgroup_enter_systemd (struct libcrun_cgroup_args *args,
   if (UNLIKELY (ret < 0))
     return ret;
 
-  /* Verify that systemd has actually installed the eBPF device filter if one was requested. */
+  /* Remove the suffix that was added by systemd_finalize.  */
+  if (is_empty_string (suffix))
+    scope_path = xstrdup (path);
+  else
+    {
+      size_t path_len = strlen (path);
+      size_t suffix_len = strlen (suffix);
+
+      scope_path = strndup (path, path_len - suffix_len - 1);
+      if (UNLIKELY (scope_path == NULL))
+        OOM ();
+    }
+
+  /* The cgroup path is chosen by systemd, so it cannot be checked before
+     the container process is moved there.  Check the scope, as the
+     sub-cgroup is created by us, and would appear not frozen even if
+     the scope is.  */
+  ret = libcrun_cgroup_ensure_not_frozen (scope_path, err);
+  if (UNLIKELY (ret < 0))
+    return ret;
+
+  /* Verify that systemd has actually installed the eBPF device filter if one was requested.
+     eBPF programs are attached to the systemd scope, not the subgroup.  */
   if (out->bpf_dev_set)
     {
-      cleanup_free char *scope_path = NULL;
-
-      /* eBPF programs are attached to the systemd scope, not the subgroup.
-         Remove the suffix that was added by systemd_finalize. */
-      if (is_empty_string (suffix))
-        scope_path = xstrdup (path);
-      else
-        {
-          size_t path_len = strlen (path);
-          size_t suffix_len = strlen (suffix);
-
-          scope_path = strndup (path, path_len - suffix_len - 1);
-          if (UNLIKELY (scope_path == NULL))
-            OOM ();
-        }
-
       ret = verify_ebpf_device_filter_installed (scope_path, err);
       if (UNLIKELY (ret < 0))
         return ret;
@@ -2117,6 +2129,9 @@ get_cgroup_scope_path (const char *cgroup_path, const char *scope)
 {
   char *path_to_scope = NULL;
   char *cur;
+
+  if (is_empty_string (cgroup_path))
+    return NULL;
 
   path_to_scope = xstrdup (cgroup_path);
 
@@ -2263,14 +2278,54 @@ libcrun_update_resources_systemd (struct libcrun_cgroup_status *cgroup_status,
   ret = 0;
 
 exit:
-  if (bus)
-    sd_bus_unref (bus);
-  if (m)
-    sd_bus_message_unref (m);
-  if (reply)
-    sd_bus_message_unref (reply);
-  sd_bus_error_free (&error);
-  return ret;
+  return cleanup_sd_bus_and_return (bus, m, reply, &error, ret);
+}
+
+/* Ask systemd to move PID to PATH, which is either the container scope
+   cgroup or its sub-cgroup.  This works even when the caller has no write
+   access to the cgroup.procs file of the common ancestor of the source and
+   the destination cgroups, as it is the case for a rootless user in a login
+   session, which is outside of user@.service.  */
+static int
+libcrun_attach_process_systemd (struct libcrun_cgroup_status *cgroup_status,
+                                const char *path, pid_t pid,
+                                libcrun_error_t *err)
+{
+  const char *scope = cgroup_status->scope;
+  sd_bus_error error = SD_BUS_ERROR_NULL;
+  cleanup_free char *scope_path = NULL;
+  sd_bus_message *reply = NULL;
+  const char *subcgroup;
+  const char *last;
+  sd_bus *bus = NULL;
+  size_t len;
+  int sd_err, ret;
+
+  if (is_empty_string (scope))
+    return crun_make_error (err, 0, "cannot attach process to cgroup: no systemd scope");
+
+  /* The sub-cgroup is relative to the scope cgroup.  */
+  scope_path = get_cgroup_scope_path (path, scope);
+  if (scope_path == NULL)
+    return crun_make_error (err, 0, "cannot attach process to cgroup: empty path");
+  last = strrchr (scope_path, '/');
+  if (last == NULL || strcmp (last + 1, scope) != 0)
+    return crun_make_error (err, 0, "cannot find scope `%s` in cgroup path `%s`", scope, path);
+  len = strlen (scope_path);
+  subcgroup = path[len] ? path + len : "/";
+
+  ret = open_sd_bus_connection (&bus, err);
+  if (UNLIKELY (ret < 0))
+    return ret;
+
+  sd_err = sd_bus_call_method (bus, "org.freedesktop.systemd1", "/org/freedesktop/systemd1",
+                               "org.freedesktop.systemd1.Manager", "AttachProcessesToUnit",
+                               &error, &reply, "ssau", scope, subcgroup, 1, (uint32_t) pid);
+  if (UNLIKELY (sd_err < 0))
+    ret = crun_make_error (err, sd_bus_error_get_errno (&error), "sd-bus call AttachProcessesToUnit: %s",
+                           error.message ?: error.name);
+
+  return cleanup_sd_bus_and_return (bus, NULL, reply, &error, ret);
 }
 
 #else
@@ -2306,6 +2361,18 @@ libcrun_update_resources_systemd (struct libcrun_cgroup_status *cgroup_status,
 
   return crun_make_error (err, ENOTSUP, "systemd not supported");
 }
+
+static int
+libcrun_attach_process_systemd (struct libcrun_cgroup_status *cgroup_status,
+                                const char *path, pid_t pid,
+                                libcrun_error_t *err)
+{
+  (void) cgroup_status;
+  (void) path;
+  (void) pid;
+
+  return crun_make_error (err, ENOTSUP, "systemd not supported");
+}
 #endif
 
 struct libcrun_cgroup_manager cgroup_manager_systemd = {
@@ -2313,4 +2380,5 @@ struct libcrun_cgroup_manager cgroup_manager_systemd = {
   .create_cgroup = libcrun_cgroup_enter_systemd,
   .destroy_cgroup = libcrun_destroy_cgroup_systemd,
   .update_resources = libcrun_update_resources_systemd,
+  .attach_process = libcrun_attach_process_systemd,
 };
